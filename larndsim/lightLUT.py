@@ -7,10 +7,10 @@ import numba as nb
 
 from numba import cuda
 
-from .consts import light
-from .consts.light import OP_CHANNEL_EFFICIENCY, OP_CHANNEL_TO_TPC
-from .consts.detector import TPC_BORDERS
-from .consts import units, detector
+#from .consts import light
+#from .consts.light import OP_CHANNEL_EFFICIENCY, OP_CHANNEL_TO_TPC
+#from .consts.detector import TPC_BORDERS
+from .consts import units, detector, light
 
 @nb.njit
 def get_voxel(pos, itpc, lut_vox_div):
@@ -25,7 +25,7 @@ def get_voxel(pos, itpc, lut_vox_div):
         tuple: indices (in x, y, z dimensions) of the voxel containing the input position
     """
 
-    this_tpc_borders = TPC_BORDERS[itpc]
+    this_tpc_borders = detector.TPC_BORDERS[itpc]
 
     # If we are in an "odd" TPC, that is, if the index of
     # the tpc is an odd number, we need to rotate x
@@ -56,6 +56,10 @@ def get_voxel(pos, itpc, lut_vox_div):
     j = int((y_max - pos[1])/(y_max - y_min) * lut_vox_div[1])
     k = int((pos[2] - z_min)/(z_max - z_min) * lut_vox_div[2])
 
+    i = min(lut_vox_div[0] - 1, max(0, i))
+    j = min(lut_vox_div[1] - 1, max(0, j))
+    k = min(lut_vox_div[2] - 1, max(0, k))
+
     return i, j, k
 
 @cuda.jit
@@ -85,13 +89,13 @@ def calculate_light_incidence(tracks, lut, light_incidence, voxel):
         # Defining number of produced photons from quencing.py
         n_photons = tracks['n_photons'][itrk]
 
-        # Identifies which tpc event takes place in
+        # Identifies which tpc and module event takes place in
         itpc = tracks["pixel_plane"][itrk]
+        imod = itpc // 2
 
         # ignore any edeps with the default itpc value,
         # they are outside any tpc
         if itpc != detector.DEFAULT_PLANE_INDEX:
-
             # Voxel containing LUT position
             lut_vox_div = lut.shape[:-1]
             i_voxel = get_voxel(pos, itpc,lut_vox_div)
@@ -108,14 +112,23 @@ def calculate_light_incidence(tracks, lut, light_incidence, voxel):
             # Calls T1 data for the voxel
             T1_dat = lut_vox['t0']
 
+            # When mod2mod variation is enabled, we simulate one module at a
+            # time. In that case, use channel_offset to go from "relative" to
+            # "absolute" channels when doing lookups in e.g.
+            # OP_CHANNEL_EFFICIENCY.
+            if light_incidence.shape[1] < light.N_OP_CHANNEL:
+                channel_offset = light_incidence.shape[1] * imod
+            else:
+                channel_offset = 0
+
             # Assigns the LUT data to the light_incidence array
-            for output_i in range(light.N_OP_CHANNEL):
-                op_channel_index = output_i
+            for output_i in range(light_incidence.shape[1]):
+                op_channel_index = output_i + channel_offset
                 lut_index = output_i % vis_dat.shape[0]
 
-                eff = OP_CHANNEL_EFFICIENCY[output_i]
-                vis = vis_dat[lut_index] * (OP_CHANNEL_TO_TPC[output_i] == itpc)
+                eff = light.OP_CHANNEL_EFFICIENCY[op_channel_index]
+                vis = vis_dat[lut_index] * (light.OP_CHANNEL_TO_TPC[op_channel_index] == itpc)
                 t1 = (T1_dat[lut_index] * units.ns + tracks['t0'][itrk] * units.mus) / units.mus
 
-                light_incidence['n_photons_det'][itrk,op_channel_index] = eff * vis * n_photons
-                light_incidence['t0_det'][itrk,op_channel_index] = t1
+                light_incidence['n_photons_det'][itrk, output_i] = eff * vis * n_photons
+                light_incidence['t0_det'][itrk, output_i] = t1

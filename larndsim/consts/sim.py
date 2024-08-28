@@ -12,10 +12,15 @@ from .units import mm, cm, V, kV
 BATCH_SIZE = 10000    # units = track segments
 EVENT_BATCH_SIZE = 1  # units = N tpcs
 WRITE_BATCH_SIZE = 1  # units = N batches
-EVENT_SEPARATOR = 'vertexID'  # 'spillID' or 'vertexID'
+EVENT_SEPARATOR = 'event_id'  # 'spillID' or 'vertexID'
 
 IS_SPILL_SIM = True
 SPILL_PERIOD = 1.2e6  # units = microseconds
+TRACKS_DSET_NAME = 'segments'
+
+# We mod event IDs by MAX_EVENTS_PER_FILE to get zero-based IDs for indexing
+# purposes; see comments in simulate_pixels.py
+MAX_EVENTS_PER_FILE = 1000
 
 def set_simulation_properties(simprop_file):
     """
@@ -34,15 +39,21 @@ def set_simulation_properties(simprop_file):
     global EVENT_SEPARATOR
     global IS_SPILL_SIM
     global SPILL_PERIOD
-    
+    global MAX_EVENTS_PER_FILE
+    global TRACKS_DSET_NAME
+    global MOD2MOD_VARIATION
 
     with open(simprop_file) as df:
         simprop = yaml.load(df, Loader=yaml.FullLoader)
 
-    BATCH_SIZE = simprop['batch_size']
-    EVENT_BATCH_SIZE = simprop['event_batch_size']
-    WRITE_BATCH_SIZE = simprop['write_batch_size']
-    EVENT_SEPARATOR = simprop['event_separator']
-    IS_SPILL_SIM = simprop['is_spill_sim']
-    SPILL_PERIOD = float(simprop['spill_period'])
-
+    try:
+        BATCH_SIZE = simprop.get('batch_size', BATCH_SIZE)
+        EVENT_BATCH_SIZE = simprop.get('event_batch_size', EVENT_BATCH_SIZE)
+        WRITE_BATCH_SIZE = simprop.get('write_batch_size', WRITE_BATCH_SIZE)
+        EVENT_SEPARATOR = simprop.get('event_separator', EVENT_SEPARATOR)
+        IS_SPILL_SIM = bool(simprop.get('is_spill_sim', IS_SPILL_SIM))
+        SPILL_PERIOD = float(simprop.get('spill_period', SPILL_PERIOD))
+        MAX_EVENTS_PER_FILE = simprop.get('max_events_per_file', MAX_EVENTS_PER_FILE)
+        TRACKS_DSET_NAME = simprop.get('tracks_dset_name', TRACKS_DSET_NAME)
+    except:
+        print("Check if all the necessary simulation properties are set. Taking some default values")

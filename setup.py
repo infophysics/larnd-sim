@@ -2,7 +2,7 @@
 
 VER = "0.3.1"
 
-reqs = ["numpy", "pytest", "numba>=0.52", "larpix-control", "larpix-geometry", "tqdm", "fire"]
+reqs = ["numpy", "pytest", "numba>=0.52", "larpix-control", "larpix-geometry", "tqdm", "fire", "nvidia-ml-py"]
 
 try:
     import cupy
@@ -34,7 +34,16 @@ setuptools.setup(
     description="Simulation framework for the DUNE LArND",
     url="https://github.com/DUNE/larnd-sim",
     packages=setuptools.find_packages(),
-    scripts=["cli/simulate_pixels.py", "cli/dumpTree.py"],
+    include_package_data=True,
+    package_data={'larndsim': ['config/*.yaml',
+    'simulation_properties/*.yaml',
+    'pixel_layouts/*.yaml',
+    'detector_properties/*.yaml',
+    'detector_properties/*.json',
+    'bin/*.npy',
+    'bin/*.npz',
+    ]},
+    scripts=["cli/simulate_pixels.py", "cli/dumpTree.py", "cli/list_config_keys.py"],
     install_requires=reqs,
     classifiers=[
         "Development Status :: 2 - Pre-Alpha",

@@ -1,23 +1,24 @@
-#! /usr/bin/env python
+#! /usr/bin/env python3
 """
 Converts ROOT file created by edep-sim into HDF5 format
 """
 
 from math import sqrt
-
+import os
 import numpy as np
 import fire
 import h5py
 from tqdm import tqdm
+import glob
 
-from ROOT import TG4Event, TFile
+from ROOT import TG4Event, TFile, TMap
 
 # Output array datatypes
-segments_dtype = np.dtype([("vertexID", "u4"), ("segment_id", "u4"), ("z_end", "f4"),
-                           ("trackID", "u4"), ("tran_diff", "f4"),
+segments_dtype = np.dtype([("event_id","u4"), ("vertex_id", "u8"), ("file_vertex_id", "u8"), ("segment_id", "u4"),
+                           ("z_end", "f4"),("traj_id", "u4"), ("file_traj_id", "u4"), ("tran_diff", "f4"),
                            ("z_start", "f4"), ("x_end", "f4"),
                            ("y_end", "f4"), ("n_electrons", "u4"),
-                           ("pdgId", "i4"), ("x_start", "f4"),
+                           ("pdg_id", "i4"), ("x_start", "f4"),
                            ("y_start", "f4"), ("t_start", "f4"),
                            ("t0_start", "f8"), ("t0_end", "f8"), ("t0", "f8"),
                            ("dx", "f4"), ("long_diff", "f4"),
@@ -26,27 +27,19 @@ segments_dtype = np.dtype([("vertexID", "u4"), ("segment_id", "u4"), ("z_end", "
                            ("y", "f4"), ("x", "f4"), ("z", "f4"),
                            ("n_photons","f4")], align=True)
 
-trajectories_dtype = np.dtype([("vertexID", "u4"), ("trackID", "u4"),
-                               ("parentID", "i4"),
-                               ("pxyz_start", "f4", (3,)),
-                               ("xyz_start", "f4", (3,)), ("t_start", "f4"),
-                               ("pxyz_end", "f4", (3,)),
-                               ("xyz_end", "f4", (3,)), ("t_end", "f4"),
-                               ("pdgId", "i4"), ("start_process", "u4"),
-                               ("start_subprocess", "u4"),
-                               ("end_process", "u4"),
-                               ("end_subprocess", "u4")], align=True)
+trajectories_dtype = np.dtype([("event_id","u4"), ("vertex_id", "u8"), ("file_vertex_id", "u8"),
+                               ("traj_id", "u4"), ("file_traj_id", "u4"), ("parent_id", "i4"), ("primary", "?"),
+                               ("E_start", "f4"), ("pxyz_start", "f4", (3,)),
+                               ("xyz_start", "f4", (3,)), ("t_start", "f8"),
+                               ("E_end", "f4"), ("pxyz_end", "f4", (3,)),
+                               ("xyz_end", "f4", (3,)), ("t_end", "f8"),
+                               ("pdg_id", "i4"), ("start_process", "u4"),
+                               ("start_subprocess", "u4"), ("end_process", "u4"),
+                               ("end_subprocess", "u4"), ("dist_travel", "f4")], align=True)
 
-vertices_dtype = np.dtype([("vertexID","u4"),("x_vert","f4"),("y_vert","f4"),("z_vert","f4")], align=True)
-
-genie_stack_dtype = np.dtype([("vertexID", "u4"), ("part_4mom", "f4", (4,)), ("part_pdg", "i4"), ("part_status", "i4")], align=True)
-
-genie_hdr_dtype = np.dtype([("vertexID", "u4"), ("vertex", "f4", (4,)), ("target", "u4"), ("isCC", "?"),
-                            ("isQES", "?"), ("isMEC", "?"), ("isRES", "?"), ("isDIS", "?"), ("isCOH", "?"),
-                            ("Enu", "f4"), ("nu_4mom", "f4", (4,)), ("nu_pdg", "i4"),
-                            ("Elep", "f4"), ("lep_mom", "f4"), ("lep_ang", "f4"), ("lep_pdg", "i4"),
-                            ("q0", "f4"), ("q3", "f4"), ("Q2", "f4"),
-                            ("x", "f4"), ("y", "f4")], align=True)
+vertices_dtype = np.dtype([("event_id","u4"), ("vertex_id","u8"), ("file_vertex_id", "u8"),
+                           ("x_vert","f4"), ("y_vert","f4"), ("z_vert","f4"),
+                           ("t_vert","f4"), ("t_event","f4")], align=True)
 
 # Convert from EDepSim default units (mm, ns)
 edep2cm = 0.1   # convert to cm
@@ -154,12 +147,10 @@ def initHDF5File(output_file):
         f.create_dataset('trajectories', (0,), dtype=trajectories_dtype, maxshape=(None,))
         f.create_dataset('segments', (0,), dtype=segments_dtype, maxshape=(None,))
         f.create_dataset('vertices', (0,), dtype=vertices_dtype, maxshape=(None,))
-        f.create_dataset('genie_stack', (0,), dtype=genie_stack_dtype, maxshape=(None,))
-        f.create_dataset('genie_hdr', (0,), dtype=genie_hdr_dtype, maxshape=(None,))
 
 # Resize HDF5 file and save output arrays
-def updateHDF5File(output_file, trajectories, segments, vertices, genie_s, genie_h):
-    if any([len(trajectories), len(segments), len(vertices), len(genie_s), len(genie_h)]):
+def updateHDF5File(output_file, trajectories, segments, vertices):
+    if any([len(trajectories), len(segments), len(vertices)]):
         with h5py.File(output_file, 'a') as f:
             if len(trajectories):
                 ntraj = len(f['trajectories'])
@@ -176,55 +167,74 @@ def updateHDF5File(output_file, trajectories, segments, vertices, genie_s, genie
                 f['vertices'].resize((nvert+len(vertices),))
                 f['vertices'][nvert:] = vertices
 
-            if len(genie_s):
-                ngenie_s = len(f['genie_stack'])
-                f['genie_stack'].resize((ngenie_s+len(genie_s),))
-                f['genie_stack'][nvert:] = genie_s
-
-            if len(genie_h):
-                ngenie_h = len(f['genie_hdr'])
-                f['genie_hdr'].resize((ngenie_h+len(genie_h),))
-                f['genie_hdr'][nvert:] = genie_h
-
 # Read a file and dump it.
-def dump(input_file, output_file):
+def dump(input_file, output_file, keep_all_dets=False):
 
-    # The input file is generated in a previous test (100TestTree.sh).
-    inputFile = TFile(input_file)
-
-    # Get the input tree out of the file.
-    inputTree = inputFile.Get("EDepSimEvents")
-    genieTree = inputFile.Get("DetSimPassThru/gRooTracker")
-    # print("Class: ", inputTree.ClassName())
-    # print("GENIE: ", genieTree.ClassName())
-
-    # Attach a brach to the events.
-    event = TG4Event()
-    inputTree.SetBranchAddress("Event",event)
-
-    # Read all of the events.
-    entries = inputTree.GetEntriesFast()
-    genie_entries = genieTree.GetEntriesFast()
-
-    # Check that the edep-sim and GENIE trees have the same number of events
-    if entries != genie_entries:
-        print("Edep-sim tree and GENIE tree number of entries do not match!")
-        return
+    """
+    Script to convert edep-sim root output to an h5 file formatted in a way
+    that larnd-sim expects for consumption.
+    Args:
+        input_file (str): path to an input ROOT file containing spills.
+        output_file (str): name of the h5 output file to which the information should
+            be written
+    """
 
     # Prep output file
     initHDF5File(output_file)
 
+    segment_id = 0
+    file_vertex_id = 0
+
+    # Get the input tree out of the file.
+    inputFile = TFile(input_file)
+    inputTree = inputFile.Get("EDepSimEvents")
+    # print("Class: ", inputTree.ClassName())
+
+    # IF CRASH: Uncomment this section (also see IF CRASH below)
+    # Attach a brach to the events.
+    # event = TG4Event()
+    # inputTree.SetBranchAddress("Event",event)
+
+    # map that gives which spill each event lives in
+    event_spill_map = inputFile.Get("event_spill_map")
+
+    if not event_spill_map:
+        spillPeriod_s = 0.
+    else:
+        spillPeriod_s = inputFile.Get("spillPeriod_s").GetVal()
+        # for setting t_spill
+        spillCounter = -1
+        lastSpill = None        # Most-recent global spill ID
+
+    # Read all of the events.
+    entries = inputTree.GetEntriesFast()
+
     segments_list = list()
     trajectories_list = list()
     vertices_list = list()
-    genie_stack_list = list()
-    genie_hdr_list = list()
 
-    segment_id = 0
+    # For assigning unique-in-file track IDs:
+    trackCounter = 0
+
     for jentry in tqdm(range(entries)):
-        #print(jentry)
+        #print(jentry,"/",entries)
         nb = inputTree.GetEntry(jentry)
-        gb = genieTree.GetEntry(jentry)
+
+        # IF CRASH: Comment this line (also see IF CRASH above)
+        event = inputTree.Event
+
+        globalVertexID = (event.RunId * 1E6) + event.EventId
+
+        if not event_spill_map:
+            spill_it = globalVertexID
+            t_spill = 0.
+        else:
+            spill_it_tobj = event_spill_map.GetValue(f"{event.RunId} {event.EventId}")
+            spill_it = int(spill_it_tobj.GetName())
+            if spill_it != lastSpill: # New spill?
+                spillCounter += 1
+                lastSpill = spill_it
+            t_spill = spillCounter * spillPeriod_s * 1E6 # convert to us
 
         # write to file
         if len(trajectories_list) >= 1000 or nb <= 0:
@@ -232,65 +242,194 @@ def dump(input_file, output_file):
                 output_file,
                 np.concatenate(trajectories_list, axis=0) if trajectories_list else np.empty((0,)),
                 np.concatenate(segments_list, axis=0) if segments_list else np.empty((0,)),
-                np.concatenate(vertices_list, axis=0) if vertices_list else np.empty((0,)),
-                np.concatenate(genie_stack_list, axis=0) if genie_stack_list else np.empty((0,)),
-                np.concatenate(genie_hdr_list, axis=0) if genie_hdr_list else np.empty((0,)))
+                np.concatenate(vertices_list, axis=0) if vertices_list else np.empty((0,)))
 
             trajectories_list = list()
             segments_list = list()
             vertices_list = list()
-            genie_hdr_list = list()
-            genie_stack_list = list()
 
         if nb <= 0:
             continue
 
-        #print("Class: ", event.ClassName())
-        #print("Event number:", event.EventId)
+        if keep_all_dets:
+            if len(event.SegmentDetectors) == 0:
+                continue
+        else:
+            # If ARCUBE_ACTIVE_VOLUME is not set, default to previously hard
+            # coded containerName.
+            if not any(containerName == os.environ.get("ARCUBE_ACTIVE_VOLUME", "volTPCActive")
+                       for containerName, _hits in event.SegmentDetectors):
+                continue
+
+        # Count total number of vertices and trajectories
+        n_traj = 0
+
+        # TrackId is unique within each edep "event"
+        # When there are multiple interactions/vertices passing edepsim as in the event, TrackId's for trajectories are unique within the event
+        # For beam simulation, an edep "event" means an interaction/vertex. In that case TrackId's are only unique within the interaction
+        vertexMap = {}
+        file_vertexMap = {}
 
         # Dump the primary vertices
-        vertex = np.empty(len(event.Primaries), dtype=vertices_dtype)
-        for primaryVertex in event.Primaries:
+        vertices = np.empty(len(event.Primaries), dtype=vertices_dtype)
+        for iVtx, primaryVertex in enumerate(event.Primaries):
             #printPrimaryVertex("PP", primaryVertex)
-            vertex["vertexID"] = event.EventId
-            vertex["x_vert"] = primaryVertex.GetPosition().X()
-            vertex["y_vert"] = primaryVertex.GetPosition().Y()
-            vertex["z_vert"] = primaryVertex.GetPosition().Z()
-            vertices_list.append(vertex)
+            vertices[iVtx]["event_id"] = event.EventId
+            vertices[iVtx]["vertex_id"] = iVtx
+            vertices[iVtx]["file_vertex_id"] = file_vertex_id
+            vertices[iVtx]["x_vert"] = primaryVertex.GetPosition().X() * edep2cm
+            vertices[iVtx]["y_vert"] = primaryVertex.GetPosition().Y() * edep2cm
+            vertices[iVtx]["z_vert"] = primaryVertex.GetPosition().Z() * edep2cm
+            vertices[iVtx]["t_vert"] = primaryVertex.GetPosition().T() * edep2us
+            vertices[iVtx]["t_event"] = t_spill
+
+            for primaryPar in primaryVertex.Particles:
+                vertexMap[primaryPar.GetTrackId()] = iVtx
+                file_vertexMap[primaryPar.GetTrackId()] = file_vertex_id
+
+            file_vertex_id += 1
+
+        vertices_list.append(vertices)
+
+        trackMap = {}
+        daughters = [] # In the end, "daughters" should have n primaries numbers of lists. Each list contains a single family line.
 
         # Dump the trajectories
-        #print("Number of trajectories ", len(event.Trajectories))
-        trajectories = np.empty(len(event.Trajectories), dtype=trajectories_dtype)
+        trajectories = np.full(len(event.Trajectories), np.iinfo(trajectories_dtype['traj_id']).max, dtype=trajectories_dtype)
         for iTraj, trajectory in enumerate(event.Trajectories):
-            start_pt, end_pt = trajectory.Points[0], trajectory.Points[-1]
-            trajectories[iTraj]["vertexID"] = event.EventId
-            trajectories[iTraj]["trackID"] = trajectory.GetTrackId()
-            trajectories[iTraj]["parentID"] = trajectory.GetParentId()
-            trajectories[iTraj]["pxyz_start"] = (start_pt.GetMomentum().X(), start_pt.GetMomentum().Y(), start_pt.GetMomentum().Z())
-            trajectories[iTraj]["pxyz_end"] = (end_pt.GetMomentum().X(), end_pt.GetMomentum().Y(), end_pt.GetMomentum().Z())
-            trajectories[iTraj]["xyz_start"] = (start_pt.GetPosition().X() * edep2cm, start_pt.GetPosition().Y() * edep2cm, start_pt.GetPosition().Z() * edep2cm)
-            trajectories[iTraj]["xyz_end"] = (end_pt.GetPosition().X() * edep2cm, end_pt.GetPosition().Y() * edep2cm, end_pt.GetPosition().Z() * edep2cm)
-            trajectories[iTraj]["t_start"] = start_pt.GetPosition().T() * edep2us
-            trajectories[iTraj]["t_end"] = end_pt.GetPosition().T() * edep2us
-            trajectories[iTraj]["start_process"] = start_pt.GetProcess()
-            trajectories[iTraj]["start_subprocess"] = start_pt.GetSubprocess()
-            trajectories[iTraj]["end_process"] = end_pt.GetProcess()
-            trajectories[iTraj]["end_subprocess"] = end_pt.GetSubprocess()
-            trajectories[iTraj]["pdgId"] = trajectory.GetPDGCode()
+            fileTrackID = trackCounter
+            trackCounter += 1
+            trackMap[trajectory.GetTrackId()] = fileTrackID
 
-        trajectories_list.append(trajectories)
+            if trajectory.GetParentId() == -1:
+                start_pt, end_pt = trajectory.Points[0], trajectory.Points[-1]
+                trajectories[n_traj]["event_id"] = event.EventId
+                trajectories[n_traj]["vertex_id"] = vertexMap[trajectory.GetTrackId()]
+                trajectories[n_traj]["file_vertex_id"] = file_vertexMap[trajectory.GetTrackId()]
+                trajectories[n_traj]["traj_id"] = trajectory.GetTrackId()
+                trajectories[n_traj]["file_traj_id"] = trackMap[trajectory.GetTrackId()]
+                trajectories[n_traj]["parent_id"] = trajectory.GetParentId()
+                trajectories[n_traj]["primary"] = True if trajectory.GetParentId() == -1 else False # primary particle parents trajectory id are -1
+
+                mass = trajectory.GetInitialMomentum().M()
+                p_start = (start_pt.GetMomentum().X(), start_pt.GetMomentum().Y(), start_pt.GetMomentum().Z())
+                p_end = (end_pt.GetMomentum().X(), end_pt.GetMomentum().Y(), end_pt.GetMomentum().Z())
+
+                trajectories[n_traj]["pxyz_start"] = p_start #(start_pt.GetMomentum().X(), start_pt.GetMomentum().Y(), start_pt.GetMomentum().Z())
+                trajectories[n_traj]["pxyz_end"] = p_end #(end_pt.GetMomentum().X(), end_pt.GetMomentum().Y(), end_pt.GetMomentum().Z())
+                trajectories[n_traj]["xyz_start"] = (start_pt.GetPosition().X() * edep2cm, start_pt.GetPosition().Y() * edep2cm, start_pt.GetPosition().Z() * edep2cm)
+                trajectories[n_traj]["xyz_end"] = (end_pt.GetPosition().X() * edep2cm, end_pt.GetPosition().Y() * edep2cm, end_pt.GetPosition().Z() * edep2cm)
+                trajectories[n_traj]["E_start"] = np.sqrt(np.sum(np.square(p_start)) + mass**2)
+                trajectories[n_traj]["E_end"] = np.sqrt(np.sum(np.square(p_end)) + mass**2)
+                trajectories[n_traj]["t_start"] = start_pt.GetPosition().T() * edep2us
+                trajectories[n_traj]["t_end"] = end_pt.GetPosition().T() * edep2us
+                trajectories[n_traj]["start_process"] = start_pt.GetProcess()
+                trajectories[n_traj]["start_subprocess"] = start_pt.GetSubprocess()
+                trajectories[n_traj]["end_process"] = end_pt.GetProcess()
+                trajectories[n_traj]["end_subprocess"] = end_pt.GetSubprocess()
+                trajectories[n_traj]["pdg_id"] = trajectory.GetPDGCode()
+                trajectories[n_traj]["dist_travel"] = 0
+                for i in range(len(trajectory.Points)-1):
+                    trajectories[n_traj]["dist_travel"] += (trajectory.Points[i].GetPosition()-trajectory.Points[i+1].GetPosition()).Vect().Mag()* edep2cm
+
+                n_traj += 1
+
+            this_daughters = []
+            i_primary = -1
+            while trajectory.GetParentId() >= -1:
+                if len(daughters) > 0 and trajectory.GetTrackId() in np.concatenate(daughters):
+                    for i_primary in range(len(daughters)):
+                        if trajectory.GetTrackId() in daughters[i_primary]:
+                            break
+                    this_daughters = this_daughters + daughters[i_primary]
+                    break # once it's in "daughters", its all ancestors should be covered
+                else:
+                    this_daughters.append(trajectory.GetTrackId())
+                    if trajectory.GetParentId() == -1:
+                        break
+                    else:
+                        parent_traj_id = trajectory.GetParentId()
+                        trajectory = event.Trajectories[parent_traj_id]
+                    continue
+            if i_primary >= 0:
+                daughters[i_primary] = this_daughters
+            else:
+                daughters.append(this_daughters)
 
         # Dump the segment containers
-        #print("Number of segment containers:", event.SegmentDetectors.size())
-
         for containerName, hitSegments in event.SegmentDetectors:
-
+            # If ARCUBE_ACTIVE_VOLUME is not set, default to previously hard
+            # coded containerName.
+            if (not keep_all_dets) and containerName != os.environ.get("ARCUBE_ACTIVE_VOLUME", "volTPCActive"):
+                continue
             segment = np.empty(len(hitSegments), dtype=segments_dtype)
             for iHit, hitSegment in enumerate(hitSegments):
-                segment[iHit]["vertexID"] = event.EventId
+                segment[iHit]["event_id"] = event.EventId
                 segment[iHit]["segment_id"] = segment_id
                 segment_id += 1
-                segment[iHit]["trackID"] = trajectories[hitSegment.Contrib[0]]["trackID"]
+                try:
+                    segment[iHit]["traj_id"] = hitSegment.Contrib[0]
+                    segment[iHit]["file_traj_id"] = trackMap[hitSegment.Contrib[0]]
+                    seg_traj_id = hitSegment.Contrib[0]
+                    if seg_traj_id in vertexMap.keys():
+                        primary_traj_id = seg_traj_id
+                    if seg_traj_id not in trajectories["traj_id"]: # trajectories is reinitialized for each edep event
+                        for i_primary in range(len(daughters)):
+                            if seg_traj_id in daughters[i_primary]:
+                                this_line = daughters[i_primary]
+                                this_line.reverse()
+                                break
+                        # Find the primary trackID
+                        for traj_id in this_line:
+                            if traj_id in vertexMap.keys():
+                                primary_traj_id = traj_id
+                                break
+                        for traj_id in this_line:
+                            if traj_id not in trajectories["traj_id"]:
+                                # Given event.Trajectories is ordered by traj_id (trajectory.GetTrackId())
+                                trajectory = event.Trajectories[traj_id]
+
+                                start_pt, end_pt = trajectory.Points[0], trajectory.Points[-1]
+                                trajectories[n_traj]["event_id"] = event.EventId
+                                trajectories[n_traj]["vertex_id"] = vertexMap[primary_traj_id]
+                                trajectories[n_traj]["file_vertex_id"] = file_vertexMap[primary_traj_id]
+
+                                trajectories[n_traj]["traj_id"] = trajectory.GetTrackId()
+                                trajectories[n_traj]["file_traj_id"] = trackMap[trajectory.GetTrackId()]
+                                trajectories[n_traj]["parent_id"] = trajectory.GetParentId()
+                                trajectories[n_traj]["primary"] = True if trajectory.GetParentId() == -1 else False # primary particle parents trajectory id are -1
+
+                                mass = trajectory.GetInitialMomentum().M()
+                                p_start = (start_pt.GetMomentum().X(), start_pt.GetMomentum().Y(), start_pt.GetMomentum().Z())
+                                p_end = (end_pt.GetMomentum().X(), end_pt.GetMomentum().Y(), end_pt.GetMomentum().Z())
+
+                                trajectories[n_traj]["pxyz_start"] = p_start #(start_pt.GetMomentum().X(), start_pt.GetMomentum().Y(), start_pt.GetMomentum().Z())
+                                trajectories[n_traj]["pxyz_end"] = p_end #(end_pt.GetMomentum().X(), end_pt.GetMomentum().Y(), end_pt.GetMomentum().Z())
+                                trajectories[n_traj]["xyz_start"] = (start_pt.GetPosition().X() * edep2cm, start_pt.GetPosition().Y() * edep2cm, start_pt.GetPosition().Z() * edep2cm)
+                                trajectories[n_traj]["xyz_end"] = (end_pt.GetPosition().X() * edep2cm, end_pt.GetPosition().Y() * edep2cm, end_pt.GetPosition().Z() * edep2cm)
+                                trajectories[n_traj]["E_start"] = np.sqrt(np.sum(np.square(p_start)) + mass**2)
+                                trajectories[n_traj]["E_end"] = np.sqrt(np.sum(np.square(p_end)) + mass**2)
+                                trajectories[n_traj]["t_start"] = start_pt.GetPosition().T() * edep2us
+                                trajectories[n_traj]["t_end"] = end_pt.GetPosition().T() * edep2us
+                                trajectories[n_traj]["start_process"] = start_pt.GetProcess()
+                                trajectories[n_traj]["start_subprocess"] = start_pt.GetSubprocess()
+                                trajectories[n_traj]["end_process"] = end_pt.GetProcess()
+                                trajectories[n_traj]["end_subprocess"] = end_pt.GetSubprocess()
+                                trajectories[n_traj]["pdg_id"] = trajectory.GetPDGCode()
+                                trajectories[n_traj]["dist_travel"] = 0
+                                for i in range(len(trajectory.Points)-1):
+                                    trajectories[n_traj]["dist_travel"] += (trajectory.Points[i].GetPosition()-trajectory.Points[i+1].GetPosition()).Vect().Mag()* edep2cm
+                                n_traj += 1
+                    segment[iHit]["vertex_id"] = vertexMap[primary_traj_id]
+                    segment[iHit]["file_vertex_id"] = file_vertexMap[primary_traj_id]
+
+                except IndexError as e:
+                    print(e)
+                    print("iHit:",iHit)
+                    print("len(segment):",len(segment))
+                    print("hitSegment.Contrib[0]:",hitSegment.Contrib[0])
+                    print("len(trajectories):",len(trajectories))
+
                 segment[iHit]["x_start"] = hitSegment.GetStart().X() * edep2cm
                 segment[iHit]["y_start"] = hitSegment.GetStart().Y() * edep2cm
                 segment[iHit]["z_start"] = hitSegment.GetStart().Z() * edep2cm
@@ -313,7 +452,7 @@ def dump(input_file, output_file):
                 segment[iHit]["t0"] = (segment[iHit]["t0_start"] + segment[iHit]["t0_end"]) / 2.
                 segment[iHit]["t"] = 0
                 segment[iHit]["dEdx"] = hitSegment.GetEnergyDeposit() / dx if dx > 0 else 0
-                segment[iHit]["pdgId"] = trajectories[hitSegment.Contrib[0]]["pdgId"]
+                segment[iHit]["pdg_id"] = trajectories[trajectories["traj_id"]==hitSegment.Contrib[0]]["pdg_id"]
                 segment[iHit]["n_electrons"] = 0
                 segment[iHit]["long_diff"] = 0
                 segment[iHit]["tran_diff"] = 0
@@ -321,88 +460,15 @@ def dump(input_file, output_file):
                 segment[iHit]["n_photons"] = 0
 
             segments_list.append(segment)
-
-        # Save truth information from GENIE
-        genie_idx = 0
-        nu_4mom = np.empty((4,), dtype='f4')
-        lep_4mom = np.empty((4,), dtype='f4')
-
-        # Create particle stack dataset
-        genie_stack = np.empty(genieTree.StdHepN, dtype=genie_stack_dtype)
-        for p in range(genieTree.StdHepN):
-
-            #Get only initial and final state particles
-            if genieTree.StdHepStatus[p] == 0 or genieTree.StdHepStatus[p] == 1:
-                genie_stack[genie_idx]["vertexID"] = event.EventId
-                genie_stack[genie_idx]["part_4mom"] = np.array([genieTree.StdHepP4[p*4 + 0]*gev2mev,
-                                                       genieTree.StdHepP4[p*4 + 1]*gev2mev,
-                                                       genieTree.StdHepP4[p*4 + 2]*gev2mev,
-                                                       genieTree.StdHepP4[p*4 + 3]*gev2mev])
-                genie_stack[genie_idx]["part_pdg"] = genieTree.StdHepPdg[p]
-                genie_stack[genie_idx]["part_status"] = genieTree.StdHepStatus[p]
-
-                #Get the incident neutrino four-vector
-                if genieTree.StdHepStatus[p] == 0 and np.abs(genieTree.StdHepPdg[p]) in [12, 14, 16]:
-                    nu_4mom = np.array([genieTree.StdHepP4[p*4 + 0]*gev2mev,
-                                        genieTree.StdHepP4[p*4 + 1]*gev2mev,
-                                        genieTree.StdHepP4[p*4 + 2]*gev2mev,
-                                        genieTree.StdHepP4[p*4 + 3]*gev2mev])
-                    nu_pdg = genieTree.StdHepPdg[p]
-
-                #Get the outgoing lepton four-vector
-                if genieTree.StdHepStatus[p] == 1 and np.abs(genieTree.StdHepPdg[p]) in [11, 12, 13, 14, 15, 16]:
-                    lep_4mom = np.array([genieTree.StdHepP4[p*4 + 0]*gev2mev,
-                                         genieTree.StdHepP4[p*4 + 1]*gev2mev,
-                                         genieTree.StdHepP4[p*4 + 2]*gev2mev,
-                                         genieTree.StdHepP4[p*4 + 3]*gev2mev])
-                    lep_pdg = genieTree.StdHepPdg[p]
-
-                #Get the struck nucleus pdg code
-                if genieTree.StdHepStatus[p] == 0 and np.abs(genieTree.StdHepPdg[p]) > 1E9:
-                    target_pdg = genieTree.StdHepPdg[p]
-
-                genie_idx += 1
-
-        #Shrink the array to remove used space
-        genie_stack.resize((genie_idx,))
-        genie_stack_list.append(genie_stack)
-
-        #Fun fact: EvtCode is a TObjString. Use GetString and Data methods to get Python string
-        genie_str = genieTree.EvtCode.GetString().Data()
-
-        #Create GENIE header/summary dataset
-        genie_hdr = np.empty(1, dtype=genie_hdr_dtype)
-        genie_hdr["vertexID"] = event.EventId
-        genie_hdr["isCC"]  = "CC" in genie_str
-        genie_hdr["isQES"] = "QES" in genie_str
-        genie_hdr["isMEC"] = "MEC" in genie_str
-        genie_hdr["isRES"] = "RES" in genie_str
-        genie_hdr["isDIS"] = "DIS" in genie_str
-        genie_hdr["isCOH"] = "COH" in genie_str
-        genie_hdr["vertex"] = np.array([genieTree.EvtVtx[0], genieTree.EvtVtx[1], genieTree.EvtVtx[2], genieTree.EvtVtx[3]]) * meter2cm
-        genie_hdr["target"] = int((target_pdg % 10000000) / 10000) #Extract Z value from PDG code
-        genie_hdr["Enu"]  = nu_4mom[3]
-        genie_hdr["nu_4mom"] = nu_4mom
-        genie_hdr["nu_pdg"] = nu_pdg
-        genie_hdr["Elep"] = lep_4mom[3]
-        genie_hdr["lep_mom"] = np.linalg.norm(lep_4mom[0:3])
-        genie_hdr["lep_ang"] = np.arccos(lep_4mom[0:3].dot(beam_dir) / (beam_norm * genie_hdr["lep_mom"])) * (180.0 / np.pi) # degrees
-        genie_hdr["lep_pdg"] = lep_pdg
-        genie_hdr["q0"]   = nu_4mom[3] - lep_4mom[3]
-        genie_hdr["q3"]   = np.linalg.norm(nu_4mom[0:3] - lep_4mom[0:3])
-        genie_hdr["Q2"]   = genie_hdr["q3"]**2 - genie_hdr["q0"]**2
-        genie_hdr["x"]    = genie_hdr["Q2"] / (2.0 * nucleon_mass * genie_hdr["q0"])
-        genie_hdr["y"]    = 1.0 - (genie_hdr["Elep"] / genie_hdr["Enu"])
-        genie_hdr_list.append(genie_hdr)
+        trajectories_list.append(trajectories[:n_traj])
 
     # save any lingering data not written to file
     updateHDF5File(
         output_file,
         np.concatenate(trajectories_list, axis=0) if trajectories_list else np.empty((0,)),
         np.concatenate(segments_list, axis=0) if segments_list else np.empty((0,)),
-        np.concatenate(vertices_list, axis=0) if vertices_list else np.empty((0,)),
-        np.concatenate(genie_stack_list, axis=0) if genie_stack_list else np.empty((0,)),
-        np.concatenate(genie_hdr_list, axis=0) if genie_hdr_list else np.empty((0,)))
+        np.concatenate(vertices_list, axis=0) if vertices_list else np.empty((0,)))
 
 if __name__ == "__main__":
     fire.Fire(dump)
+
