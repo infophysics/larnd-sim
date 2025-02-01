@@ -21,9 +21,6 @@ from .consts import units
 from .consts import sim
 from .consts import detector
 
-from .fee import CLOCK_CYCLE, ROLLOVER_CYCLES, PPS_CYCLES, CLOCK_RESET_PERIOD, USE_PPS_ROLLOVER
-
-
 def get_nticks(light_incidence):
     """
     Calculates the number of time ticks needed to simulate light signals of the
@@ -36,7 +33,8 @@ def get_nticks(light_incidence):
         tuple: number of time ticks (`int`), time of first tick (`float`) [in microseconds]
     """
     mask = light_incidence['n_photons_det'] > 0
-    if np.any(mask) and not light.LIGHT_TRIG_MODE == 1:
+    # only use the first photon arrival time if it's threshold trigger
+    if np.any(mask) and light.LIGHT_TRIG_MODE == 0:
         start_time = np.min(light_incidence['t0_det'][mask]) - light.LIGHT_WINDOW[0]
         end_time = np.max(light_incidence['t0_det'][mask]) + light.LIGHT_WINDOW[1]
         return int(np.ceil((end_time - start_time)/light.LIGHT_TICK_SIZE)), start_time
@@ -58,7 +56,7 @@ def get_active_op_channel(light_incidence):
     return cp.empty((0,), dtype='i4')
     
 @cuda.jit
-def sum_light_signals(segments, segment_voxel, segment_track_id, light_inc, op_channel, lut, start_time, light_sample_inc, light_sample_inc_true_track_id, light_sample_inc_true_photons, sorted_indices):
+def sum_light_signals(segments, segment_voxel, segment_track_id, light_inc, op_channel, lut, start_time, light_sample_inc, light_sample_inc_true_track_id, light_sample_inc_true_photons, sorted_indices, t0_profile_length):
     """
     Sums the number of photons observed by each light detector at each time tick
 
@@ -88,28 +86,24 @@ def sum_light_signals(segments, segment_voxel, segment_track_id, light_inc, op_c
             for itrk in sorted_indices[idet]:
                 if light_inc[itrk,op_channel[idet]]['n_photons_det'] > 0:
                     voxel = segment_voxel[itrk]
-                    time_profile = lut[voxel[0],voxel[1],voxel[2],idet_lut]['time_dist']
                     track_time = segments[itrk]['t0']
-                    track_end_time = track_time + time_profile.shape[0] * units.ns / units.mus # FIXME: assumes light LUT time profile bins are 1ns (might not be true in general)
+                    track_end_time = track_time + t0_profile_length * units.ns / units.mus # FIXME: assumes light LUT time profile bins are 1ns (might not be true in general)
 
                     if track_end_time < start_tick_time or track_time > end_tick_time:
                         continue
 
                     # use LUT time smearing
                     if light.ENABLE_LUT_SMEARING:
-                        # normalize propogation delay time profile
-                        norm = 0
-                        for iprof in range(time_profile.shape[0]):
-                            norm += time_profile[iprof]
+                        time_profile = lut[voxel[0],voxel[1],voxel[2],idet_lut]['time_dist'] # normalised
 
                         # add photons to time tick
                         for iprof in range(time_profile.shape[0]):
                             profile_time = track_time + iprof * units.ns / units.mus # FIXME: assumes light LUT time profile bins are 1ns (might not be true in general)
                             if profile_time < end_tick_time and profile_time > start_tick_time:
-                                photons = light_inc['n_photons_det'][itrk,op_channel[idet]] * time_profile[iprof] / norm / light.LIGHT_TICK_SIZE
+                                photons = light_inc['n_photons_det'][itrk,op_channel[idet]] * time_profile[iprof] / light.LIGHT_TICK_SIZE
                                 light_sample_inc[idet,itick] += photons
 
-                                if photons > light.MC_TRUTH_THRESHOLD:
+                                if photons > sim.MC_TRUTH_THRESHOLD:
                                     # get truth information for time tick
                                     for itrue in range(light_sample_inc_true_track_id.shape[-1]):
                                         if light_sample_inc_true_track_id[idet,itick,itrue] == -1 or light_sample_inc_true_track_id[idet,itick,itrue] == segment_track_id[itrk]:
@@ -119,19 +113,14 @@ def sum_light_signals(segments, segment_voxel, segment_track_id, light_inc, op_c
                     # use average time only
                     else:
                         # calculate average delay time
-                        avg = 0
-                        norm = 0
-                        for iprof in range(time_profile.shape[0]):
-                            avg += iprof * units.ns / units.mus * time_profile[iprof]
-                            norm += time_profile[iprof]
-                        avg = avg / norm
+                        t0_avg = lut[voxel[0],voxel[1],voxel[2],idet_lut]['t0_avg'] * units.ns / units.mus # normalised averagein us
 
                         # add photons to time tick
-                        profile_time = track_time + avg
+                        profile_time = track_time + t0_avg
                         if profile_time < end_tick_time and profile_time > start_tick_time:
                             photons = light_inc['n_photons_det'][itrk,op_channel[idet]] / light.LIGHT_TICK_SIZE
                             light_sample_inc[idet,itick] += photons
-                            if photons > light.MC_TRUTH_THRESHOLD:
+                            if photons > sim.MC_TRUTH_THRESHOLD:
                                 # get truth information for time tick
                                 for itrue in range(light_sample_inc_true_track_id.shape[-1]):
                                     if light_sample_inc_true_track_id[idet,itick,itrue] == -1 or light_sample_inc_true_track_id[idet,itick,itrue] == segment_track_id[itrk]:
@@ -183,7 +172,7 @@ def calc_scintillation_effect(light_sample_inc, light_sample_inc_true_track_id, 
                     if light_sample_inc_true_track_id[idet,jtick,itrue] == -1:
                         break
                         
-                    if tick_weight * light_sample_inc_true_photons[idet,jtick,itrue] < light.MC_TRUTH_THRESHOLD:
+                    if tick_weight * light_sample_inc_true_photons[idet,jtick,itrue] < sim.MC_TRUTH_THRESHOLD:
                         continue
 
                     # loop over current tick truth
@@ -335,7 +324,7 @@ def calc_light_detector_response(light_sample_inc, light_sample_inc_true_track_i
                     if light_sample_inc_true_track_id[idet,jtick,itrue] == -1:
                         break
                         
-                    if abs(tick_weight * light_sample_inc_true_photons[idet,jtick,itrue]) < light.MC_TRUTH_THRESHOLD:
+                    if abs(tick_weight * light_sample_inc_true_photons[idet,jtick,itrue]) < sim.MC_TRUTH_THRESHOLD:
                         continue
 
                     # loop over current tick truth
@@ -536,7 +525,7 @@ def digitize_signal(signal, signal_op_channel_idx, trigger_idx, trigger_op_chann
                         # interpolate true photons
                         photons0 = signal_true_photons[idet,itick0,jtrue]
                         
-                        if abs(photons0) < light.MC_TRUTH_THRESHOLD:
+                        if abs(photons0) < sim.MC_TRUTH_THRESHOLD:
                             continue
 
                         # loop over next tick
@@ -714,7 +703,7 @@ def export_light_wvfm_to_hdf5(event_id, waveforms, output_filename, waveforms_tr
         # Store the light truth backtracking, in the same way for module variation turned on and off
         # skip creating the truth dataset if there is no truth information to store
         truth_data=None
-        if light.MAX_MC_TRUTH_IDS > 0:
+        if sim.MAX_MC_TRUTH_IDS > 0:
             truth_data = zero_suppress_waveform_truth(waveforms_true_track_id, waveforms_true_photons, event_id[0], i_trig, i_mod)
             if truth_data.shape[0] > 0:
                 if f'light_wvfm_mc_assn' not in f:
@@ -741,13 +730,13 @@ def export_light_trig_to_hdf5(event_id, start_times, trigger_idx, op_channel_idx
     
     unique_events, unique_events_inv = np.unique(event_id, return_inverse=True)
     event_start_times = event_times[unique_events_inv]
-    event_sync_times = (event_times[unique_events_inv] / CLOCK_CYCLE).astype(int) % CLOCK_RESET_PERIOD
+    event_sync_times = (event_times[unique_events_inv] / detector.CLOCK_CYCLE).astype(int) % detector.CLOCK_RESET_PERIOD
 
     with h5py.File(output_filename, 'a') as f:
         trig_data = np.empty(trigger_idx.shape[0], dtype=np.dtype([('op_channel','i4',(op_channel_idx.shape[-1])), ('ts_s','f8'), ('ts_sync','u8')]))
         trig_data['op_channel'] = op_channel_idx
         trig_data['ts_s'] = ((start_times + trigger_idx * light.LIGHT_TICK_SIZE + event_start_times) * units.mus / units.s)
-        trig_data['ts_sync'] = (((start_times + trigger_idx * light.LIGHT_TICK_SIZE)/CLOCK_CYCLE + event_sync_times).astype(int) % CLOCK_RESET_PERIOD)
+        trig_data['ts_sync'] = (((start_times + trigger_idx * light.LIGHT_TICK_SIZE)/detector.CLOCK_CYCLE + event_sync_times).astype(int) % detector.CLOCK_RESET_PERIOD)
 
         if 'light_trig' not in f:
             f.create_dataset('light_trig', data=trig_data, maxshape=(None,))

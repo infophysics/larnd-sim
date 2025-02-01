@@ -4,7 +4,7 @@ on the pixels
 """
 
 from math import pi, ceil, sqrt, erf, exp, log
-
+import cupy as cp
 import numba as nb
 
 from numba import cuda
@@ -12,11 +12,8 @@ from numba.cuda.random import xoroshiro128p_normal_float32
 
 #from .consts.detector import TPC_BORDERS, TIME_INTERVAL
 from .consts import detector
+from .consts import sim
 from .pixels_from_track import id2pixel
-
-MAX_TRACKS_PER_PIXEL = 50
-MIN_STEP_SIZE = 0.001 # cm
-MC_SAMPLE_MULTIPLIER = 1
 
 @cuda.jit
 def time_intervals(track_starts, time_max, tracks):
@@ -319,14 +316,14 @@ def tracks_current_mc(signals, pixels, tracks, response, rng_states):
             if subsegment_length == 0:
                 return
 
-            nstep = max(round(subsegment_length / MIN_STEP_SIZE), 1)
+            nstep = max(round(subsegment_length / sim.MIN_STEP_SIZE), 1)
             step = subsegment_length / nstep # refine step size
 
-            charge = t["n_electrons"] * (subsegment_length/length) / (nstep*MC_SAMPLE_MULTIPLIER)
+            charge = t["n_electrons"] * (subsegment_length/length) / (nstep*sim.MC_SAMPLE_MULTIPLIER)
             total_current = 0
             rng_state = (rng_states[itrk + ntrk * ipix],)
             for istep in range(nstep):
-                for _ in range(MC_SAMPLE_MULTIPLIER):
+                for _ in range(sim.MC_SAMPLE_MULTIPLIER):
                     x = subsegment_start[0] + step * (istep + 0.5) * direction[0]
                     y = subsegment_start[1] + step * (istep + 0.5) * direction[1]
                     z = subsegment_start[2] + step * (istep + 0.5) * direction[2]
@@ -470,7 +467,7 @@ def sign(x):
 
 @cuda.jit
 def sum_pixel_signals(pixels_signals, signals, track_starts, pixel_index_map, track_pixel_map, pixels_tracks_signals,
-                      overflow_flag):
+                      num_backtrack, offset_backtrack, overflow_flag):
     """
     This function sums the induced current signals on the same pixel.
     Converting "signals" from per segment to per pixel ("pixel_signals" and "pixels_tracks_signals")
@@ -493,18 +490,26 @@ def sum_pixel_signals(pixels_signals, signals, track_starts, pixel_index_map, tr
         overflow_flag (:obj:`cp.array`): Single-element output array to indicate whether
             MAX_TRACKS_PER_PIXEL is insufficient
     """
-    # itrk goes up to the total number of the segments in this batch
-    # ipix goes up to the max number of pixel for any segment
-    # itick is time ticks along the entire drift span
+    # itrk: segment index in signals collection, goes up to the total number of the segments in this batch
+    # ipix: pixel index within signals collection, goes up to the max number of pixel for any segment
+    # itick: time ticks along the entire drift span
 
     # pixel_index goes up to the total number of pixels in this batch
     # track_index (counter) goes up to "MAX_TRACKS_PER_PIXEL"
+    # counter = segment index in pixels_tracks_signals collection, same as track_index ordering
+
     itrk, ipix, itick = cuda.grid(3)
+
+    # equivalent to num_backtrack.sum()
+    total_backtracks = offset_backtrack[-1] + num_backtrack[-1]
 
     if itrk < signals.shape[0] and ipix < signals.shape[1]:
 
         pixel_index = pixel_index_map[itrk][ipix]
         start_tick = round(track_starts[itrk] / detector.TIME_SAMPLING)
+        # index into the jagged pixels_tracks_signals array for this pixel and tick
+        itime = start_tick + itick
+        base_idx = total_backtracks * itime + offset_backtrack[pixel_index]
 
         if pixel_index >= 0:
             counter = -99
@@ -514,19 +519,17 @@ def sum_pixel_signals(pixels_signals, signals, track_starts, pixel_index_map, tr
                 if itrk == int(track_pixel_map[pixel_index][track_idx]):
                     counter = track_idx
                     if counter >= 0 and itick < signals.shape[2]:
-                        itime = start_tick + itick
                         if itime < pixels_signals.shape[1] and itime > -1:
                             cuda.atomic.add(pixels_signals,
                                             (pixel_index, itime),
                                             signals[itrk][ipix][itick])
                             cuda.atomic.add(pixels_tracks_signals,
-                                            (pixel_index, itime, counter),
+                                            base_idx + counter,
                                             signals[itrk][ipix][itick])
                     break
 
             if counter < 0:
                 overflow_flag[pixel_index] = 1
-
 
 @cuda.jit
 def get_track_pixel_map(track_pixel_map, unique_pix, pixels):
@@ -562,3 +565,48 @@ def get_track_pixel_map(track_pixel_map, unique_pix, pixels):
 
                 if imap < track_pixel_map.shape[1]:
                     track_pixel_map[index][imap] = itrk
+
+@cuda.jit
+def get_track_pixel_map2(track_pixel_map, unique_pix, pixels, distances, max_distance):
+    """
+    This kernel fills a 2D array which contains, for each unique pixel,
+    an array with the track indeces associated to that pixel.
+
+    Args:
+        track_pixel_map_col (:obj:`numpy.ndarray`): 2D array that will contain the
+            association between the unique pixels array and the track indeces
+        unique_pix (:obj:`numpy.ndarray`): 1D array containing the unique pixels
+        pixels (:obj:`numpy.ndarray`): 2D array containing the pixels for each
+            track.
+    """
+    # index of unique_pix array
+    index = cuda.grid(1)
+
+    upix = unique_pix[index]
+
+    for target_dist in range(max_distance):
+    
+        for itrk in range(pixels.shape[0]):
+
+            for ipix in range(pixels.shape[1]):
+                pID  = pixels[itrk][ipix]
+                dist = distances[itrk][ipix]
+
+                if (upix == pID):
+                    if (dist == target_dist): 
+
+                        imap = 0
+                        #while imap < track_pixel_map.shape[1] and track_pixel_map[index][imap] != -1 and track_pixel_map[index][imap] != itrk:
+                        while imap < track_pixel_map.shape[1]:
+                            if track_pixel_map[index][imap] == itrk:
+                                imap = -1
+                                break
+                            if track_pixel_map[index][imap] == -1:
+                                break
+                            else:
+                                imap += 1
+
+                        if (imap >= 0) and (imap < track_pixel_map.shape[1]):
+                            track_pixel_map[index][imap] = itrk
+
+                    break

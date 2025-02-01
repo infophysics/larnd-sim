@@ -4,16 +4,16 @@ Sets ligth-related constants
 import yaml
 import numpy as np
 import os
+import numbers
 
-#: Number of true segments to track for each time tick (`MAX_MC_TRUTH_IDS=0` to disable complete truth tracking)
-MAX_MC_TRUTH_IDS = 0 # higher is better, but file size increases
-#: Threshold for propogating truth information on a given SiPM
-MC_TRUTH_THRESHOLD = 0.1 # pe/us lower is better, but memory usage increases
+from . import detector
+
+LIGHT_SIMULATED = True
+
 ENABLE_LUT_SMEARING = False
 
 N_OP_CHANNEL = 0
-LIGHT_SIMULATED = True
-OP_CHANNEL_EFFICIENCY = np.zeros(0)
+OP_CHANNEL_EFFICIENCY = np.ones(0)
 OP_CHANNEL_TO_TPC = np.zeros(0)
 TPC_TO_OP_CHANNEL = np.zeros((0,0))
 
@@ -72,10 +72,9 @@ def set_light_properties(detprop_file):
         detprop_file (str): detector properties YAML filename
 
     """
-    global MAX_MC_TRUTH_IDS
-    global MC_TRUTH_THRESHOLD
-    global N_OP_CHANNEL
     global LIGHT_SIMULATED
+
+    global N_OP_CHANNEL
     global OP_CHANNEL_EFFICIENCY
     global OP_CHANNEL_TO_TPC
     global TPC_TO_OP_CHANNEL
@@ -108,19 +107,34 @@ def set_light_properties(detprop_file):
 
     try:
         LIGHT_SIMULATED = bool(detprop.get('light_simulated', LIGHT_SIMULATED))
-        MAX_MC_TRUTH_IDS = detprop.get('max_light_truth_ids', MAX_MC_TRUTH_IDS)
-        MC_TRUTH_THRESHOLD = detprop.get('mc_truth_threshold', MC_TRUTH_THRESHOLD)
 
+        mod_ids = detector.get_n_modules(detprop_file)
+        n_tpc = len(mod_ids)*2
         N_OP_CHANNEL = detprop['n_op_channel']
-        OP_CHANNEL_EFFICIENCY = np.array(detprop['op_channel_efficiency'])
+        if N_OP_CHANNEL % n_tpc != 0:
+            raise ValueError("N_OP_CHANNEL should be a multiple of n_tpc.")
+        if N_OP_CHANNEL % OP_CHANNEL_PER_TRIG != 0:
+            raise ValueError("N_OP_CHANNEL should be a multiple of number of SiPM per light unit (The default is 6).")
+        OP_CHANNEL_EFFICIENCY = np.array(detprop.get('op_channel_efficiency', OP_CHANNEL_EFFICIENCY))
+        if OP_CHANNEL_EFFICIENCY.size == 1:
+            OP_CHANNEL_EFFICIENCY = np.full(N_OP_CHANNEL, OP_CHANNEL_EFFICIENCY)
 
-        tpc_to_op_channel = detprop['tpc_to_op_channel']
-        OP_CHANNEL_TO_TPC = np.zeros((N_OP_CHANNEL,), int)
-        TPC_TO_OP_CHANNEL = np.zeros((len(tpc_to_op_channel), len(tpc_to_op_channel[0])), int)
-        for itpc in range(len(tpc_to_op_channel)):
-            TPC_TO_OP_CHANNEL[itpc] = np.array(tpc_to_op_channel[itpc])
-            for idet in tpc_to_op_channel[itpc]:
-                OP_CHANNEL_TO_TPC[idet] = itpc
+        try:
+            tpc_to_op_channel = detprop['tpc_to_op_channel']
+            OP_CHANNEL_TO_TPC = np.zeros((N_OP_CHANNEL,), int)
+            TPC_TO_OP_CHANNEL = np.zeros((len(tpc_to_op_channel), len(tpc_to_op_channel[0])), int)
+            for itpc in range(len(tpc_to_op_channel)):
+                TPC_TO_OP_CHANNEL[itpc] = np.array(tpc_to_op_channel[itpc])
+                for idet in tpc_to_op_channel[itpc]:
+                    OP_CHANNEL_TO_TPC[idet] = itpc
+        except:
+            n_op_per_tpc = int(N_OP_CHANNEL/n_tpc)
+            OP_CHANNEL_TO_TPC = np.zeros((N_OP_CHANNEL,), int)
+            TPC_TO_OP_CHANNEL = np.zeros((n_tpc, n_op_per_tpc), int)
+            for itpc in range(n_tpc):
+                TPC_TO_OP_CHANNEL[itpc] = np.arange(itpc*n_op_per_tpc, (itpc+1)*n_op_per_tpc)
+                for idet in TPC_TO_OP_CHANNEL[itpc]:
+                    OP_CHANNEL_TO_TPC[idet] = itpc
 
         ENABLE_LUT_SMEARING = bool(detprop.get('enable_lut_smearing', ENABLE_LUT_SMEARING))
         LIGHT_TICK_SIZE = float(detprop.get('light_tick_size', LIGHT_TICK_SIZE))
@@ -133,7 +147,7 @@ def set_light_properties(detprop_file):
 
         LIGHT_GAIN = np.array(detprop.get('light_gain', [DEFAULT_LIGHT_GAIN]))
         if LIGHT_GAIN.size == 1:
-            LIGHT_GAIN = np.full(OP_CHANNEL_EFFICIENCY.shape, LIGHT_GAIN)
+            LIGHT_GAIN = np.full(N_OP_CHANNEL, LIGHT_GAIN)
         assert LIGHT_GAIN.shape == OP_CHANNEL_EFFICIENCY.shape
         SIPM_RESPONSE_MODEL = int(detprop.get('sipm_response_model', SIPM_RESPONSE_MODEL))
         assert SIPM_RESPONSE_MODEL in (0,1)
@@ -142,7 +156,6 @@ def set_light_properties(detprop_file):
         LIGHT_OSCILLATION_PERIOD = float(detprop.get('light_oscillation_period', LIGHT_OSCILLATION_PERIOD))
         impulse_model_filename = str(detprop.get('impulse_model', ''))
         if impulse_model_filename and SIPM_RESPONSE_MODEL == 1:
-            print('Light impulse model:', impulse_model_filename)
             try:
                 # first try to load from current directory
                 IMPULSE_MODEL = np.load(impulse_model_filename)
@@ -151,16 +164,24 @@ def set_light_properties(detprop_file):
                 try:
                     IMPULSE_MODEL = np.load(os.path.join(os.path.dirname(__file__), '../../') + impulse_model_filename)
                 except FileNotFoundError:
-                    print("Impulse model file not found:", impulse_model_filename)
+                    SIPM_RESPONSE_MODEL = 0
+                    print("Impulse model file not found:", impulse_model_filename, ", and setting SIPM_RESPONSE_MODEL to 0 (RLC model).")
         IMPULSE_TICK_SIZE = float(detprop.get('impulse_tick_size', IMPULSE_TICK_SIZE))
 
         OP_CHANNEL_PER_TRIG = int(detprop.get('op_channel_per_det', OP_CHANNEL_PER_TRIG))
         LIGHT_TRIG_MODE = int(detprop.get('light_trig_mode', LIGHT_TRIG_MODE))
         assert LIGHT_TRIG_MODE in (0,1)
+        # One threshold for an ArCLight unit or three LCM units (6 SiPMs each)
+        # A single threshold for all channels
         if isinstance(detprop['light_trig_threshold'], (float, int)):
             LIGHT_TRIG_THRESHOLD = np.full(N_OP_CHANNEL // OP_CHANNEL_PER_TRIG, float(detprop['light_trig_threshold']))
+        # Assuming the same threshold is applied for all ACL and another one for all LCM
+        elif isinstance(detprop['light_trig_threshold'], list) and len(detprop['light_trig_threshold']) == 2:
+            LIGHT_TRIG_THRESHOLD = np.tile(np.array(detprop['light_trig_threshold'], dtype=float), N_OP_CHANNEL // OP_CHANNEL_PER_TRIG)
         else:
             LIGHT_TRIG_THRESHOLD = np.array(detprop['light_trig_threshold'], dtype=float)
+            if len(LIGHT_TRIG_THRESHOLD) != (N_OP_CHANNEL // OP_CHANNEL_PER_TRIG):
+                raise ValueError("The light_trig_threshold is provided as a list but with a length not matched with n_op_channel.")
         LIGHT_TRIG_WINDOW = tuple(detprop.get('light_trig_window', LIGHT_TRIG_WINDOW))
         assert len(LIGHT_TRIG_WINDOW) == 2
         LIGHT_DIGIT_SAMPLE_SPACING = float(detprop.get('light_digit_sample_spacing', LIGHT_DIGIT_SAMPLE_SPACING))
@@ -170,3 +191,5 @@ def set_light_properties(detprop_file):
 
     except KeyError:
         LIGHT_SIMULATED = False
+        LIGHT_TRIG_MODE = int(detprop.get('light_trig_mode', LIGHT_TRIG_MODE))
+        assert LIGHT_TRIG_MODE in (0,1)
